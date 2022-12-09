@@ -69,19 +69,26 @@ OBJ_CLASS_INSTANCE(mca_ompio_request_t, ompi_request_t,
 void mca_common_ompio_request_construct(mca_ompio_request_t* req)
 {
     OMPI_REQUEST_INIT (&(req->req_ompi), false );
-    req->req_ompi.req_free   = mca_common_ompio_request_free;
-    req->req_ompi.req_cancel = mca_common_ompio_request_cancel;
-    req->req_ompi.req_type   = OMPI_REQUEST_IO;
-    req->req_data            = NULL;
-    req->req_tbuf            = NULL;
-    req->req_size            = 0;
-    req->req_progress_fn     = NULL;
-    req->req_free_fn         = NULL;
+    req->req_ompi.req_free     = mca_common_ompio_request_free;
+    req->req_ompi.req_cancel   = mca_common_ompio_request_cancel;
+    req->req_ompi.req_type     = OMPI_REQUEST_IO;
+    req->req_data              = NULL;
+    req->req_tbuf              = NULL;
+    req->req_size              = 0;
+    req->req_max_data          = 0;
+    req->req_progress_fn       = NULL;
+    req->req_free_fn           = NULL;
+    req->req_parent            = NULL;
+    req->req_post_next_subreq  = NULL;
+    req->req_num_subreqs       = 0;
+    req->req_subreqs_completed = 0;
+    req->req_fh                = NULL;
 
     OBJ_CONSTRUCT(&req->req_item, opal_list_item_t);
     opal_list_append (&mca_common_ompio_pending_requests, &req->req_item);
     return;
 }
+
 void mca_common_ompio_request_destruct(mca_ompio_request_t* req)
 {
     OMPI_REQUEST_FINI ( &(req->req_ompi));
@@ -142,16 +149,44 @@ int mca_common_ompio_progress ( void )
         if( REQUEST_COMPLETE(&req->req_ompi) ) {
             continue;
         }
-        if ( NULL != req->req_progress_fn ) {
-            if ( req->req_progress_fn(req) ) {
-                completed++;
-                ompi_request_complete (&req->req_ompi, true);
+        if (NULL != req->req_progress_fn) {
+            if (req->req_progress_fn(req)) {
+		/**
+		 * To support pipelined read/write operations, a user level request
+		 * can contain multiple internal requests. These sub-requests
+		 * contain a pointer to the main/parent request.
+		 */
+		mca_ompio_request_t *parent = req->req_parent;
+		if (NULL != parent) {
+		    /* This is a subrequest */
+		    if (OMPI_SUCCESS != req->req_ompi.req_status.MPI_ERROR) {
+			parent->req_ompi.req_status.MPI_ERROR = req->req_ompi.req_status.MPI_ERROR;
+			ompi_request_complete (&parent->req_ompi, true);
+			continue;
+		    }
+		    parent->req_subreqs_completed++;
+		    parent->req_ompi.req_status._ucount += req->req_ompi.req_status._ucount;
+		    parent->req_post_next_subreq(parent, parent->req_subreqs_completed);
+		    ompi_request_complete (&req->req_ompi, true);
+		    ompi_request_free ((ompi_request_t**)&req);
+		} else {
+		    /* This is a user-level request */
+		    if (req->req_num_subreqs == req->req_subreqs_completed) {
+			completed++;
+			ompi_request_complete (&req->req_ompi, true);
+		    }
+		}
                 /* The fbtl progress function is expected to set the
                  * status elements
                  */
             }
-        }
-
+        } else {
+	    /* This is the parent request */
+	    if (req->req_num_subreqs == req->req_subreqs_completed) {
+		completed++;
+		ompi_request_complete (&req->req_ompi, true);
+	    }
+	}
     }
 
     return completed;
